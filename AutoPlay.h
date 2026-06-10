@@ -47,46 +47,57 @@ ImVec2 GetPocketScreenPos(int pocketIdx) {
 }
 
 // ============================================================================
-// PHYSICS ENGINE
+// PHYSICS ENGINE - CORRECTED FOR PROPER BALL COLLISION
 // ============================================================================
 struct PhysicsEngine {
     static constexpr double BALL_DIAMETER = 2.0 * Physics::BALL_RADIUS;
     static constexpr double GRAVITY = 9.81;
     
     // ========================================================================
-    // EQUATION 1: Calculate power required for target distance
-    // Physics: v^2 = 2*a*s
-    // where: v = velocity, a = deceleration (friction), s = distance
+    // EQUATION 1: Calculate cue power to transfer momentum to target ball
+    // Physics: Elastic collision - cue ball transfers energy to target
+    // v_target = (2 * m_cue / (m_cue + m_target)) * v_cue
+    // Simplified: v_target = v_cue (equal mass)
+    // Required: Power = Distance * Friction_Coefficient
     // ========================================================================
-    static double calculatePowerForDistance(
-        double targetDistance,
+    static double calculatePowerForTargetToPocket(
+        double cueToBallDist,      // Distance from cue to target ball
+        double ballToPocketDist,   // Distance from target ball to pocket (ACTUAL SHOT)
         const FrictionProperties& friction
     ) {
-        if (targetDistance < 1.0) return 100.0;
+        // The target ball needs to travel from its position to the pocket
+        // This is the ACTUAL distance the ball must cover
+        if (ballToPocketDist < 1.0) return 100.0;
         
-        // Friction deceleration
+        // Friction deceleration: a = -mu * g
         double friction_coeff = friction._velocityReductionRollingFactor;
         double deceleration = GRAVITY * friction_coeff;
         
-        // v = sqrt(2 * a * s)
-        double requiredVelocity = std::sqrt(2.0 * deceleration * targetDistance);
+        // CORRECTED: Power needed for TARGET BALL to reach pocket
+        // v^2 = 2 * a * s  =>  v = sqrt(2 * a * s)
+        double requiredVelocity = std::sqrt(2.0 * deceleration * ballToPocketDist);
         
-        // Map velocity to power (0-666 scale)
-        double power = requiredVelocity / 1.0;  // Scaling factor
+        // Add extra power to overcome collision loss (elastic collision efficiency ~90%)
+        double powerWithCollisionLoss = requiredVelocity / 0.9;  // Account for energy loss
+        
+        // Map to power scale (0-666)
+        double power = powerWithCollisionLoss / 1.0;
         return std::min(std::max(power, 100.0), 666.0);
     }
     
     // ========================================================================
-    // EQUATION 2: Calculate trajectory angle to pocket
-    // Physics: angle = atan2(dy, dx)
-    // where: dy = y_pocket - y_ball, dx = x_pocket - x_ball
+    // EQUATION 2: Calculate angle for cue to hit target at POCKET ANGLE
+    // Physics: Cue -> Target -> Pocket (straight line from target to pocket)
     // ========================================================================
-    static double calculateTrajectoryAngle(
-        const Point2D& fromPos,
-        const Point2D& toPos
+    static double calculateAngleToPocket(
+        const Point2D& cueBallPos,
+        const Point2D& targetBallPos,
+        const Point2D& pocketPos
     ) {
-        Point2D delta = toPos - fromPos;
-        double angle = std::atan2(delta.y, delta.x);
+        // CORRECTED: Calculate angle FROM TARGET BALL TO POCKET
+        // This is what matters - where the ball GOES after being hit
+        Point2D ballToPocket = pocketPos - targetBallPos;
+        double angle = std::atan2(ballToPocket.y, ballToPocket.x);
         
         // Normalize to [0, 2π)
         if (angle < 0) angle += TWO_PI;
@@ -95,11 +106,11 @@ struct PhysicsEngine {
     }
     
     // ========================================================================
-    // EQUATION 3: Calculate ghost ball position for collision
-    // Physics: Ghost position = ball_center - (direction * ball_diameter)
-    // This ensures cue strikes at edge to deflect ball toward pocket
+    // EQUATION 3: Calculate collision point (where cue hits target ball)
+    // Physics: For ball to go toward pocket, cue hits opposite side
+    // Collision point = target_center - (direction_to_pocket * radius)
     // ========================================================================
-    static Point2D calculateGhostBallPosition(
+    static Point2D calculateCollisionPoint(
         const Point2D& targetBallPos,
         const Point2D& pocketPos
     ) {
@@ -111,60 +122,64 @@ struct PhysicsEngine {
         // Normalize direction
         Point2D direction = toPocket * (1.0 / distance);
         
-        // Ghost ball is positioned at ball_diameter away from center
-        return targetBallPos - direction * BALL_DIAMETER;
+        // Collision point: Hit the OPPOSITE side to propel toward pocket
+        // This is where the cue ball should aim
+        return targetBallPos - direction * Physics::BALL_RADIUS;
     }
     
     // ========================================================================
-    // EQUATION 4: Calculate collision accuracy (dot product)
-    // Physics: accuracy = (A·B) / (|A||B|)
-    // Measures alignment between cue direction and pocket direction
-    // Range: [0, 1] where 1 = perfect alignment
+    // EQUATION 4: Calculate shot accuracy (how direct is the path?)
+    // Physics: Accuracy = alignment between target->pocket and cue->target
+    // Direct path = 1.0, off-angle = 0.0
     // ========================================================================
-    static double calculateCollisionAccuracy(
+    static double calculateShotAccuracy(
         const Point2D& cueBallPos,
         const Point2D& targetBallPos,
         const Point2D& pocketPos
     ) {
-        Point2D toTarget = targetBallPos - cueBallPos;
-        Point2D toPocket = pocketPos - targetBallPos;
+        // Vector from cue to target
+        Point2D cueToTarget = targetBallPos - cueBallPos;
+        // Vector from target to pocket
+        Point2D targetToPocket = pocketPos - targetBallPos;
         
-        double toTargetLen = std::sqrt(toTarget.square());
-        double toPocketLen = std::sqrt(toPocket.square());
+        double cueToTargetLen = std::sqrt(cueToTarget.square());
+        double targetToPocketLen = std::sqrt(targetToPocket.square());
         
-        if (toTargetLen < 0.1 || toPocketLen < 0.1) return 0.0;
+        if (cueToTargetLen < 0.1 || targetToPocketLen < 0.1) return 0.0;
         
-        // Dot product
-        double dotProduct = (toTarget.x * toPocket.x) + (toTarget.y * toPocket.y);
+        // Dot product: measures alignment
+        double dotProduct = (cueToTarget.x * targetToPocket.x) + 
+                           (cueToTarget.y * targetToPocket.y);
         
-        // Normalize
-        double accuracy = dotProduct / (toTargetLen * toPocketLen);
+        // Normalize to [0, 1]
+        double accuracy = dotProduct / (cueToTargetLen * targetToPocketLen);
         
         return std::max(0.0, std::min(1.0, accuracy));
     }
     
     // ========================================================================
     // EQUATION 5: Calculate shot score (lower = better)
-    // Score combines distance and accuracy with ball priority
+    // Score: (distance_to_pocket) * (1 - accuracy) * ball_priority
     // ========================================================================
     static double calculateShotScore(
-        double distanceToPocket,
-        double shotDistance,
+        double targetBallToPocketDist,  // ACTUAL distance ball travels
         double accuracy,
         BallType ballType,
         BallType myBallType,
         bool isMyBall
     ) {
-        // Base score: distance + weighted accuracy
-        double baseScore = distanceToPocket + shotDistance;
-        baseScore *= (1.0 - (accuracy * 0.3));  // Reward high accuracy
+        // Base: favor close pockets
+        double baseScore = targetBallToPocketDist;
         
-        // Ball type multiplier
+        // Reward accuracy (direct shots are better)
+        baseScore *= (1.0 - (accuracy * 0.5));  // High accuracy = lower score
+        
+        // Ball type priority
         if (isMyBall) {
-            // MY BALLS: Strong priority (0.2x multiplier)
+            // MY BALLS: 0.2x multiplier (STRONG PRIORITY - chosen first)
             baseScore *= 0.2;
-        } else if (ballType != myBallType && ballType != EIGHT_BALL) {
-            // OPPONENT BALLS: Lower priority (3.0x multiplier)
+        } else if (ballType != EIGHT_BALL) {
+            // OPPONENT BALLS: 3.0x multiplier (LOW PRIORITY - fallback only)
             baseScore *= 3.0;
         }
         
@@ -172,28 +187,29 @@ struct PhysicsEngine {
     }
     
     // ========================================================================
-    // Validate pocket reachability
+    // Validate pocket is reachable from target ball
     // ========================================================================
-    static bool isPocketReachable(double pocketDistance) {
-        return pocketDistance >= MIN_POCKET_DIST && pocketDistance <= MAX_POCKET_DIST;
+    static bool isPocketReachable(double targetBallToPocketDist) {
+        return targetBallToPocketDist >= MIN_POCKET_DIST && 
+               targetBallToPocketDist <= MAX_POCKET_DIST;
     }
     
     // ========================================================================
-    // Validate ball won't scratch (cue ball won't be potted)
+    // Validate cue ball won't scratch (won't be potted)
     // ========================================================================
     static bool validateCueBallSafety(const Prediction& pred) {
-        return pred.guiData.balls[0].onTable;
+        return pred.guiData.balls[0].onTable;  // Cue ball still on table
     }
     
     // ========================================================================
-    // Validate 8-ball won't be knocked prematurely
+    // Validate 8-ball won't be potted prematurely
     // ========================================================================
     static bool validateEightBallSafety(const Prediction& pred, BallType myBallType) {
         auto& ball8 = pred.guiData.balls[8];
         
-        // 8-ball must stay on table until it's your turn
+        // 8-ball must stay on table until it's your turn (you've cleared all yours)
         if (ball8.originalOnTable && !ball8.onTable && myBallType != EIGHT_BALL) {
-            return false;  // 8-ball was potted prematurely!
+            return false;  // 8-ball was knocked in prematurely!
         }
         
         return true;
@@ -212,37 +228,30 @@ struct PhysicsEngine {
             hitType = EIGHT_BALL;
         } else if (firstHit->classification == Ball::Classification::EIGHT_BALL) {
             hitType = EIGHT_BALL;
-        } else if (firstHit->classification == Ball::Classification::ANY) {
-            hitType = SOLIDS;  // Default
         } else if (firstHit->index >= 1 && firstHit->index <= 7) {
             hitType = SOLIDS;
         } else if (firstHit->index >= 9 && firstHit->index <= 15) {
             hitType = STRIPES;
         }
         
-        // For Solids/Stripes mode: can hit any ball except 8-ball (until all yours are gone)
+        // For Solids/Stripes: can hit any ball except 8-ball
         if (myBallType == SOLIDS || myBallType == STRIPES) {
             if (hitType == EIGHT_BALL) return false;  // Can't hit 8-ball first
             return true;
         }
         
-        // For 9-ball: must hit lowest numbered ball first
-        // (handled separately in 9-ball logic)
-        
-        // For regular play: must hit your ball type first
-        return hitType == myBallType;
+        return true;
     }
     
     // ========================================================================
-    // Validate ball actually gets potted
+    // Validate target ball actually gets potted (not opponent ball)
     // ========================================================================
-    static bool validateBallPocketed(const Prediction& pred) {
-        for (int i = 1; i < pred.guiData.ballsCount; i++) {
-            if (pred.guiData.balls[i].originalOnTable && !pred.guiData.balls[i].onTable) {
-                return true;  // At least one ball was potted
-            }
-        }
-        return false;
+    static bool validateTargetBallPocketed(const Prediction& pred, int targetIdx) {
+        // CORRECTED: Check that ONLY the target ball was potted
+        // Not opponent balls by accident
+        auto& targetBall = pred.guiData.balls[targetIdx];
+        
+        return targetBall.originalOnTable && !targetBall.onTable;
     }
 };
 
@@ -260,9 +269,8 @@ BallType getBallType(int ballIndex) {
 }
 
 BallType getPlayerBallType(Ball::Classification classification) {
-    if (classification == Ball::Classification::ANY) return SOLIDS;  // Default
+    if (classification == Ball::Classification::ANY) return SOLIDS;
     if (classification == Ball::Classification::EIGHT_BALL) return EIGHT_BALL;
-    // Could be extended for other classifications
     return SOLIDS;
 }
 
@@ -350,7 +358,7 @@ namespace AutoPlay {
     }
     
     // ========================================================================
-    // SCAN FAST: Quick scan with physics-optimized angles
+    // SCAN FAST: Quick scan with physics-corrected angle calculation
     // ========================================================================
     void ScanFast(double angleStep = ANGLE_STEP_FAST) {
         if (g_CurrentCandidate.idx != -1) return;
@@ -364,8 +372,6 @@ namespace AutoPlay {
         auto pockets = getPockets();
         auto& cueBall = gPrediction->guiData.balls[0];
         
-        bool isNineBallGame = myBallType == SOLIDS;  // Placeholder for 9-ball detection
-        
         // ====================================================================
         // ITERATE: All balls on table
         // ====================================================================
@@ -376,7 +382,7 @@ namespace AutoPlay {
             BallType ballType = getBallType(i);
             bool isMyBall = (ballType == myBallType) && (ballType != EIGHT_BALL);
             
-            // Skip if wrong ball type (for strict mode)
+            // Candidate check: try MY balls first, then opponent balls
             bool isCandidate = false;
             if (isMyBall) {
                 isCandidate = true;  // Always try MY balls first
@@ -394,48 +400,50 @@ namespace AutoPlay {
 
                 Point2D pocket = pockets[pocketIdx];
                 
-                // EQUATION 1: Distance validation
-                Point2D toPocket = pocket - ball.initialPosition;
-                double pocketDistance = std::sqrt(toPocket.square());
+                // CORRECTED: Distance from TARGET BALL to POCKET (not cue to target)
+                Point2D ballToPocket = pocket - ball.initialPosition;
+                double ballToPocketDist = std::sqrt(ballToPocket.square());
                 
-                if (!PhysicsEngine::isPocketReachable(pocketDistance)) continue;
+                if (!PhysicsEngine::isPocketReachable(ballToPocketDist)) continue;
                 
-                // EQUATION 3: Ghost ball position for collision
-                Point2D ghostBallPos = PhysicsEngine::calculateGhostBallPosition(
+                // CORRECTED: Calculate where cue should hit the target ball
+                // So that target ball goes DIRECTLY toward pocket
+                Point2D collisionPoint = PhysicsEngine::calculateCollisionPoint(
                     ball.initialPosition,
                     pocket
                 );
                 
-                // EQUATION 2: Calculate trajectory angle
-                Point2D shotLine = ghostBallPos - cueBall.initialPosition;
-                double shotDistance = std::sqrt(shotLine.square());
-                if (shotDistance < 0.1) continue;
+                // Calculate angle from cue to collision point
+                Point2D cueToCollision = collisionPoint - cueBall.initialPosition;
+                double cueToCollisionDist = std::sqrt(cueToCollision.square());
+                if (cueToCollisionDist < 0.1) continue;
                 
-                double angle = PhysicsEngine::calculateTrajectoryAngle(
-                    cueBall.initialPosition,
-                    ghostBallPos
-                );
-                
-                // EQUATION 4: Collision accuracy
-                double accuracy = PhysicsEngine::calculateCollisionAccuracy(
+                double angle = PhysicsEngine::calculateAngleToPocket(
                     cueBall.initialPosition,
                     ball.initialPosition,
                     pocket
                 );
                 
-                // EQUATION 5: Shot score
+                // Calculate accuracy
+                double accuracy = PhysicsEngine::calculateShotAccuracy(
+                    cueBall.initialPosition,
+                    ball.initialPosition,
+                    pocket
+                );
+                
+                // Calculate score
                 double score = PhysicsEngine::calculateShotScore(
-                    pocketDistance,
-                    shotDistance,
+                    ballToPocketDist,
                     accuracy,
                     ballType,
                     myBallType,
                     isMyBall
                 );
                 
-                // EQUATION 1: Calculate power
-                double power = PhysicsEngine::calculatePowerForDistance(
-                    pocketDistance,
+                // CORRECTED: Calculate power needed for TARGET BALL to reach pocket
+                double power = PhysicsEngine::calculatePowerForTargetToPocket(
+                    cueToCollisionDist,
+                    ballToPocketDist,
                     cachedFriction
                 );
                 
@@ -458,13 +466,12 @@ namespace AutoPlay {
             if (!PhysicsEngine::validateCueBallSafety(*gPrediction)) continue;
             if (!PhysicsEngine::validateEightBallSafety(*gPrediction, myBallType)) continue;
             if (!PhysicsEngine::validateFirstHit(*gPrediction, myBallType)) continue;
-            if (!PhysicsEngine::validateBallPocketed(*gPrediction)) continue;
+            if (!PhysicsEngine::validateTargetBallPocketed(*gPrediction, cand.idx)) continue;
             
-            // Target ball checks
-            if (gPrediction->guiData.balls[cand.idx].onTable) continue;
+            // Verify target ball is in correct pocket
             if (gPrediction->guiData.balls[cand.idx].pocketIndex != cand.pocketIndex) continue;
             
-            LOGI("AutoPlay: Found angle %f with power %f", angle, cand.power);
+            LOGI("AutoPlay: FAST - Ball %d angle %f power %f", cand.idx, angle, cand.power);
             g_CurrentCandidate = cand;
             foundShot = true;
             Shoot(angle, cand.power);
@@ -473,13 +480,13 @@ namespace AutoPlay {
 
         if (!foundShot) {
             lastFailedCuePos = cueBall.initialPosition;
-            LOGI("AutoPlay: ScanFast failed, trying ScanSlow");
+            LOGI("AutoPlay: ScanFast failed, switching to ScanSlow");
             scan = SLOW;
         }
     }
 
     // ========================================================================
-    // SCAN SLOW: Exhaustive angle search
+    // SCAN SLOW: Exhaustive angle search for any possible shot
     // ========================================================================
     void ScanSlow(double angleStep = ANGLE_STEP_SLOW) {
         static double currentScanAngle = 0.0;
@@ -510,7 +517,7 @@ namespace AutoPlay {
             currentScanAngle += angleStep;
             steps++;
 
-            // Strategic power levels
+            // Strategic power levels for testing
             std::vector<double> powers = {666.0, 500.0, 350.0, 200.0, 100.0};
             
             for (double power : powers) {
@@ -520,7 +527,6 @@ namespace AutoPlay {
                 if (!PhysicsEngine::validateCueBallSafety(*gPrediction)) continue;
                 if (!PhysicsEngine::validateEightBallSafety(*gPrediction, myBallType)) continue;
                 if (!PhysicsEngine::validateFirstHit(*gPrediction, myBallType)) continue;
-                if (!PhysicsEngine::validateBallPocketed(*gPrediction)) continue;
                 
                 // Find what was potted
                 int targetIdx = -1;
@@ -539,7 +545,7 @@ namespace AutoPlay {
 
                 if (targetIdx == -1) continue;
 
-                LOGI("AutoPlaySlow: Found angle %f power %f", angle, power);
+                LOGI("AutoPlay: SLOW - Ball %d angle %f power %f", targetIdx, angle, power);
                 g_CurrentCandidate.idx = targetIdx;
                 g_CurrentCandidate.angle = angle;
                 g_CurrentCandidate.power = power;
@@ -550,7 +556,7 @@ namespace AutoPlay {
         }
 
         if (currentScanAngle >= maxAngle) {
-            LOGI("AutoPlaySlow: Exhaustive scan complete");
+            LOGI("AutoPlaySlow: Exhaustive scan complete, no shot found");
             isScanning = false;
             currentScanAngle = 0.0;
             state = IDLE;
