@@ -205,7 +205,7 @@ namespace AutoPlay {
         }
     }
     
-    // Enhanced ScanFast with physics-based power calculation
+    // Enhanced ScanFast with physics-based power calculation - ATTEMPTS ALL BALLS
     void ScanFast(double angleStep = 0.1f) {
         if (g_CurrentCandidate.idx != -1) return;
         if (gPrediction->guiData.balls[0].initialPosition == lastFailedCuePos) return;
@@ -244,12 +244,22 @@ namespace AutoPlay {
                 iFoundLowestNumberedBall = i;
             }
 
-            if (!isNineBallGame) {
-                bool isACandidate = myclass == Ball::Classification::ANY ? 
-                    ball.classification != Ball::Classification::EIGHT_BALL : 
-                    ball.classification == myclass;
-                if (!isACandidate) continue;
+            // MODIFIED: Attempt ALL valid balls, not just matching classification
+            bool isACandidate = false;
+            
+            if (isNineBallGame) {
+                // In 9-ball, only hit the lowest numbered ball
+                isACandidate = (i == iFoundLowestNumberedBall);
+            } else if (myclass == Ball::Classification::ANY) {
+                // Solids/Stripes: hit any ball except 8-ball
+                isACandidate = (ball.classification != Ball::Classification::EIGHT_BALL &&
+                               ball.classification != Ball::Classification::CUE_BALL);
+            } else {
+                // Regular 8-ball: attempt ALL balls
+                isACandidate = true;
             }
+            
+            if (!isACandidate) continue;
 
             for (int pocketIdx = 0; pocketIdx < pockets.size(); pocketIdx++) {
                 if (nominatedPocket < 6 && pocketIdx != nominatedPocket) continue;
@@ -268,6 +278,13 @@ namespace AutoPlay {
                 if (angle < 0) angle += 2 * M_PI;
                 
                 double score = distCueToTarget + distTargetToPocket;
+                
+                // Prioritize easy balls (YOUR balls) over difficult ones
+                if (myclass != Ball::Classification::ANY && ball.classification == myclass) {
+                    score *= 0.5;  // Easy balls get priority (lower score)
+                } else if (myclass != Ball::Classification::ANY && ball.classification != Ball::Classification::EIGHT_BALL) {
+                    score *= 2.0;  // Opponent balls are backup (higher score)
+                }
                 
                 // 🎱 Physics-based power calculation
                 double basePower = PhysicalValidator::calculateRealisticPower(
@@ -333,16 +350,17 @@ namespace AutoPlay {
 
             std::vector<int> currentPottedBalls;
             bool isAngleGood = false;
-            for (int i = 1; i < gPrediction->guiData.ballsCount; i++) {
-                Prediction::Ball& ball = gPrediction->guiData.balls[i];
-                bool match = (myclass == Ball::Classification::ANY)
-                    ? (ball.classification != Ball::Classification::CUE_BALL && ball.classification != Ball::Classification::EIGHT_BALL)
-                    : (ball.classification == myclass);
-
-                if (match && ball.originalOnTable && !ball.onTable) {
-                    currentPottedBalls.push_back(i);
-                    isAngleGood = true;
-                }
+            
+            auto& targetBall = gPrediction->guiData.balls[cand.idx];
+            
+            // Check if correct ball was potted
+            if (myclass == Ball::Classification::ANY) {
+                // Solids/Stripes: any ball except 8-ball is good
+                isAngleGood = (targetBall.classification != Ball::Classification::CUE_BALL && 
+                              targetBall.classification != Ball::Classification::EIGHT_BALL);
+            } else {
+                // Regular 8-ball: YOUR ball should be potted
+                isAngleGood = (targetBall.classification == myclass);
             }
 
             if (isAngleGood && gPrediction->guiData.collision.firstHitBall) {
@@ -461,15 +479,25 @@ namespace AutoPlay {
                     break;
                 }
 
+                // MODIFIED: Check ALL balls for validity
                 for (int i = 1; i < gPrediction->guiData.ballsCount; i++) {
                     auto& ball = gPrediction->guiData.balls[i];
                     if (ball.originalOnTable && !ball.onTable) {
                         bool isValidTarget = false;
                         
                         if (myclass == Ball::Classification::ANY) {
-                            if (ball.classification != Ball::Classification::CUE_BALL && ball.classification != Ball::Classification::EIGHT_BALL) isValidTarget = true;
+                            // Solids/Stripes: any ball except 8-ball
+                            if (ball.classification != Ball::Classification::CUE_BALL && 
+                                ball.classification != Ball::Classification::EIGHT_BALL) {
+                                isValidTarget = true;
+                            }
                         } else {
-                            if (ball.classification == myclass) isValidTarget = true;
+                            // Regular 8-ball: attempt ALL balls
+                            if (ball.classification == myclass || 
+                                (ball.classification != Ball::Classification::EIGHT_BALL &&
+                                 ball.classification != Ball::Classification::CUE_BALL)) {
+                                isValidTarget = true;
+                            }
                         }
                         
                         if (nominatedPocket < 6 && ball.pocketIndex != nominatedPocket) isValidTarget = false;
